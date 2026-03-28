@@ -1,6 +1,7 @@
 def main():
     print("Hello from minimind!")
 
-asdkh
+asdkhsafd
+
 if __name__ == "__main__":
     main
