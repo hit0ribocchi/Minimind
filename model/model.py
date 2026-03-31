@@ -70,3 +70,45 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+import math
+
+class RMSnorm(nn.Module):
+    def __init__(self, dim:int, eps:float=1e-5):
+        super().__init__()
+        self.dim=dim
+        self.eps=eps
+        self.weight=nn.Paramter(torch.ones(dim))
+    def _norm(self,x):
+        return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)*x
+    def forward(self,x):
+        return self.weight*self._norm(x.float()).type_as(x)
+
+def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+    #初始化
+    freqs,attn_factor=1./rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim),1.0
+    if rope_scaling is not None:
+        orig_max,factor,beta_fast,beta_slow=(
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beat_fast"],
+            rope_scaling["beat_slow"])
+        
+        #推断长度大于训练长度,需要使用缩放
+        if end > orig_max:
+            #计算i索引的匿名函数
+            inv_dim = lambda b: (dim*math.log(orig_max/(b*2*math.pi))/2*math.log(rope_base))
+
+            #YaRN方法存在一个斜坡函数，上下界分别为high和low，值为1和0，中间是混合函数，在LLaMA模型中分别为1和32（实验得到）
+            #low:小于为高频部分
+            #high:大于为低频部分
+            low,high=max(math.floor(inv_dim(beta_fast)),0),min(math.ceil(inv_dim(beta_slow)),dim//2-1)
+
+            #计算缩放函数
+            ramp=torch.clamp((torch.arange(dim//2,device=freqs.device)-low)/max(high-low,0.001),0,1)
+
+            #在频率上应用缩放因子
+
+            freqs=freqs*()
