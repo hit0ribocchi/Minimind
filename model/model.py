@@ -1,5 +1,8 @@
 from transformers import PretrainedConfig
-
+import torch
+import torch.nn as nn
+import math
+import torch.nn.functional as F
 
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -71,9 +74,6 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
-import torch
-import torch.nn as nn
-import math
 
 class RMSnorm(nn.Module):
     def __init__(self, dim:int, eps:float=1e-5):
@@ -86,20 +86,22 @@ class RMSnorm(nn.Module):
     def forward(self,x):
         return self.weight*self._norm(x.float()).type_as(x)
 
-def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+
+#RoPE&YaRN
+def precompute_freqs_cis(dim:int,end:int=32*1024,rope_base:float=10000.0,rope_scaling:dict=None):
     #初始化
     freqs,attn_factor=1./rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim),1.0
     if rope_scaling is not None:
         orig_max,factor,beta_fast,beta_slow=(
             rope_scaling["original_max_position_embeddings"],
             rope_scaling["factor"],
-            rope_scaling["beat_fast"],
-            rope_scaling["beat_slow"])
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"])
         
         #推断长度大于训练长度,需要使用缩放
         if end > orig_max:
             #计算i索引的匿名函数
-            inv_dim = lambda b: (dim*math.log(orig_max/(b*2*math.pi))/2*math.log(rope_base))
+            def inv_dim(b): return dim*math.log(orig_max/(b*2*math.pi))/(2*math.log(rope_base))
 
             #YaRN方法存在一个斜坡函数，上下界分别为high和low，值为1和0，中间是混合函数，在LLaMA模型中分别为1和32（实验得到）
             #low:小于为高频部分
@@ -110,5 +112,87 @@ def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optiona
             ramp=torch.clamp((torch.arange(dim//2,device=freqs.device)-low)/max(high-low,0.001),0,1)
 
             #在频率上应用缩放因子
+            # 当 ramp=0 时（高频），系数为1，保持频率不变
+            # 当 ramp=1 时（低频），系数为1/factor，线性缩放
+            # 当 ramp在0-1之间时，平滑过度
+            freqs=freqs*(1-ramp)+freqs/factor*ramp
+        # 根据end申城位置索引
+    t = torch.arange(end,device=freqs.devices()).float()
 
-            freqs=freqs*()
+    #计算外积，得到每个位置的旋转角度
+    freqs=torch.outer(t,freqs).float()
+
+    freqs_cos = (torch.cat([torch.cos(freqs),torch.cos(freqs)],dim=-1))*attn_factor
+    freqs_sin = (torch.cat([torch.sin(freqs),torch.sin(freqs)],dim=-1))*attn_factor
+
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emb(q, k, cos ,sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        return torch.cat((-x[...,x.shape[-1]//2:],x[...,x.shape[...,:x.shape[-1]//2]]),dim=-1)
+    
+    #  公式为x*cos + rotate_half(x)*sin
+    q_emb=(q*cos.unsqueeze(unsqueeze_dim))+(rotate_half(q)*sin.unsqueeze(unsqueeze_dim))
+    k_emb=(k*cos.unsqueeze(unsqueeze_dim))+(rotate_half(k)*sin.unsqueeze(unsqueeze_dim))
+    return q_emb,k_emb
+
+#GQA
+def repeat_kv(x:torch.tensor,n_rep:int)->torch.tensor:
+    bs,slen,num_head,head_dim=x.shape()
+    if n_rep==1:
+        return x
+    return x[:,:,:, None,:].expand(bs, slen, num_head, n_rep, head_dim).reshape(bs, slen, n_rep*num_head, head_dim)
+
+class Attention(nn.Module):
+    def __init__(self,args:MokioMindConfig):
+        super.__init__()
+        self.num_key_value_heads=args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        #检查Q的头数能否被KV整除
+        assert args.num_attention_heads%self.num_key_value_heads==0,"num_attention_heads% must be divisible by num_key_value_heads"
+        #Q的头数和KV的头数
+        self.n_local_heads=args.num_attention_heads
+        self.n_local_kv_heads=self.num_key_value_heads
+        self.n_rep=self.n_local_heads//self.num_key_value_heads
+        self.head_dim=args.hidden_size//args.num_attention_heads
+
+        self.q_proj=nn.Linear(args.hidden_size,args.num_attention_heads*self.head_dim,bias=False)
+        self.k_proj=nn.Linear(args.hidden_size,self.num_key_value_heads*self.head_dim,bias=False)
+        self.k_proj=nn.Linear(args.hidden_size,self.num_key_value_heads*self.head_dim,bias=False)
+        self.o_proj=nn.Linear(args.num_attention_heads*self.head_dim,args.hidden_size,bias=False)
+
+        self.q_norm=RMSnorm(self.head_dim,eps=args.rms_norm_eps)
+        self.k_norm=RMSnorm(self.head_dim,eps=args.rms_norm_eps)
+
+        self.attn_drop=nn.Dropout(args.dropout)
+        self.resid_drop=nn.Dropout(args.dropout)
+        self.dropout=args.dropout
+
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention') and args.flash_attention
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bs, slen, _ = x.shape()
+        q, k ,v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = q.view(bs, slen, self.n_local_heads, self.head_dim)
+        xk = k.view(bs, slen, self.n_local_kv_heads, self.head_dim)
+        xv = v.view(bs, slen, self.n_local_kv_heads, self.head_dim)
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+
+        cos, sin=position_embeddings
+        xq, xk=apply_rotary_pos_emb(xq, xk, cos, sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+        xq, xk, xv = (xq.transpose(1,2), repeat_kv(xk,self.n_rep).transpose(1,2), repeat_kv(xv, self.n_rep).transpose(1,2))
+        if self.flash and (slen > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores = xq @ xk.transpose(-1,-2)/math.sqrt(self.head_dim)
+            scores[:, :, :, -slen:] += torch.full((slen, slen), float("-inf"), device=scores.device).triu(1)#
+            if attention_mask is not None: 
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_drop(F.sofmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        output = output.transpose(1, 2).reshape(bs, slen, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
